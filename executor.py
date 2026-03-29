@@ -1,14 +1,12 @@
-# executor.py
-
-from collections import defaultdict, deque
+from collections import defaultdict
 from nodes.registry import NODE_REGISTRY
 
-# Nodes that should run before LLM regardless of graph position
+# Lower number = runs earlier
 NODE_PRIORITY = {
     "document_upload": 0,
     "text_input":      0,
-    "rag_tm":          1,
-    "vector_db":       1,
+    "rag_tm":          1,   # must run BEFORE llm_agent
+    "vector_db":       1,   # must run BEFORE llm_agent
     "llm_agent":       2,
     "translation":     2,
     "compliance":      3,
@@ -21,33 +19,41 @@ NODE_PRIORITY = {
 
 def build_execution_order(nodes: list[dict], edges: list[dict]) -> list[str]:
     node_ids = {n["id"] for n in nodes}
-    node_type_map = {n["id"]: n.get("data", {}).get("nodeType", "") for n in nodes}
+    node_type_map = {
+        n["id"]: n.get("data", {}).get("nodeType", "") for n in nodes
+    }
 
     in_degree: dict[str, int] = {nid: 0 for nid in node_ids}
     adjacency: dict[str, list[str]] = defaultdict(list)
 
     for edge in edges:
-        src = edge["source"]
-        tgt = edge["target"]
+        src = edge.get("source")
+        tgt = edge.get("target")
         if src in node_ids and tgt in node_ids:
             adjacency[src].append(tgt)
             in_degree[tgt] += 1
 
-    # Use a priority-sorted list instead of a plain deque
-    ready = [nid for nid, deg in in_degree.items() if deg == 0]
-    ready.sort(key=lambda nid: NODE_PRIORITY.get(node_type_map[nid], 99))
+    def priority(nid: str) -> int:
+        return NODE_PRIORITY.get(node_type_map.get(nid, ""), 99)
+
+    # Start with all zero-in-degree nodes, sorted by priority
+    ready = sorted(
+        [nid for nid, deg in in_degree.items() if deg == 0],
+        key=priority,
+    )
 
     order = []
 
     while ready:
+        # Always pick the highest-priority (lowest number) ready node
         nid = ready.pop(0)
         order.append(nid)
-        neighbours = adjacency[nid]
-        for neighbour in neighbours:
+
+        for neighbour in adjacency[nid]:
             in_degree[neighbour] -= 1
             if in_degree[neighbour] == 0:
                 ready.append(neighbour)
-                ready.sort(key=lambda n: NODE_PRIORITY.get(node_type_map[n], 99))
+                ready.sort(key=priority)
 
     if len(order) != len(node_ids):
         raise ValueError("Workflow graph has a cycle — cannot execute.")
@@ -77,7 +83,7 @@ async def execute_workflow(
                 "node_id": node_id,
                 "node_type": node_type,
                 "status": "skipped",
-                "reason": f"No handler registered for nodeType '{node_type}'",
+                "reason": f"No handler for nodeType '{node_type}'",
             })
             continue
 
