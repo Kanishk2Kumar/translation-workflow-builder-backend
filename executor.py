@@ -1,20 +1,24 @@
 from collections import defaultdict
 from nodes.registry import NODE_REGISTRY
 
-# Lower number = runs earlier
 NODE_PRIORITY = {
-    "document_upload": 0,
-    "text_input":      0,
-    "rag_tm":          1,   # must run BEFORE llm_agent
-    "vector_db":       1,   # must run BEFORE llm_agent
-    "llm_agent":       2,
-    "translation":     2,
-    "compliance":      3,
-    "comet_qe":        3,
-    "output":          4,
-    "document_output": 4,
-    "learning":        5,
+    "document_upload":    0,
+    "document_parser":    0,
+    "text_input":         0,
+    "rag_tm":             1,
+    "vector_db":          1,
+    "llm_agent":          2,
+    "translation":        2,
+    "compliance":         3,
+    "comet_qe":           3,
+    "document_rebuilder": 4,
+    "output":             5,
+    "document_output":    5,
+    "learning":           6,
 }
+
+# These node types must always run BEFORE llm_agent
+SUPPORT_NODE_TYPES = {"rag_tm", "vector_db"}
 
 
 def build_execution_order(nodes: list[dict], edges: list[dict]) -> list[str]:
@@ -23,32 +27,46 @@ def build_execution_order(nodes: list[dict], edges: list[dict]) -> list[str]:
         n["id"]: n.get("data", {}).get("nodeType", "") for n in nodes
     }
 
+    # Separate main-flow edges from sub-handle edges
+    main_edges = []
+    sub_edges = []
+    for edge in edges:
+        if edge.get("sourceHandle"):
+            sub_edges.append(edge)
+        else:
+            main_edges.append(edge)
+
+    # Build adjacency only from MAIN flow edges
+    # Sub-handle edges (llm→rag) encode support relationships, not execution order
     in_degree: dict[str, int] = {nid: 0 for nid in node_ids}
     adjacency: dict[str, list[str]] = defaultdict(list)
 
-    for edge in edges:
+    for edge in main_edges:
         src = edge.get("source")
         tgt = edge.get("target")
         if src in node_ids and tgt in node_ids:
+            # Skip edges where target is a support node — they don't depend on LLM
+            if node_type_map.get(tgt) in SUPPORT_NODE_TYPES:
+                continue
+            # Skip edges where source is a support node in main flow
+            if node_type_map.get(src) in SUPPORT_NODE_TYPES:
+                continue
             adjacency[src].append(tgt)
             in_degree[tgt] += 1
 
+    # Support nodes have no in-degree — they start ready and priority sorts them first
     def priority(nid: str) -> int:
         return NODE_PRIORITY.get(node_type_map.get(nid, ""), 99)
 
-    # Start with all zero-in-degree nodes, sorted by priority
     ready = sorted(
         [nid for nid, deg in in_degree.items() if deg == 0],
         key=priority,
     )
 
     order = []
-
     while ready:
-        # Always pick the highest-priority (lowest number) ready node
         nid = ready.pop(0)
         order.append(nid)
-
         for neighbour in adjacency[nid]:
             in_degree[neighbour] -= 1
             if in_degree[neighbour] == 0:

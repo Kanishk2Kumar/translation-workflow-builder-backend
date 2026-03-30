@@ -25,7 +25,7 @@ class DocumentUploadNode(BaseNode):
         segments = split_sentences(raw_text)
 
         return {
-            **context,
+            **context,          # ← spread first — preserves file_bytes, source_filename, etc.
             "raw_text": raw_text,
             "segments": segments,
             "segment_count": len(segments),

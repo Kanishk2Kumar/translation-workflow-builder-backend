@@ -1,14 +1,18 @@
 from nodes.document_upload import DocumentUploadNode
+from nodes.document_parser import DocumentParserNode       # new
+from nodes.document_rebuilder import DocumentRebuilderNode  # new
 from nodes.rag_tm import RAGNode
 from nodes.llm_agent import LLMAgentNode
 from nodes.output import OutputNode
 
 NODE_REGISTRY: dict[str, type] = {
-    "document_upload": DocumentUploadNode,
-    "rag_tm":          RAGNode,
-    "vector_db":       RAGNode,       # same class for demo; vector_db = read-only RAG
-    "llm_agent":       LLMAgentNode,
-    "translation":     LLMAgentNode,  # translation node is just an LLM agent with defaults
-    "output":          OutputNode,
-    "document_output": OutputNode,
+    "document_upload":    DocumentUploadNode,
+    "document_parser":    DocumentParserNode,    # new
+    "document_rebuilder": DocumentRebuilderNode, # new
+    "rag_tm":             RAGNode,
+    "vector_db":          RAGNode,
+    "llm_agent":          LLMAgentNode,
+    "translation":        LLMAgentNode,
+    "output":             OutputNode,
+    "document_output":    OutputNode,
 }

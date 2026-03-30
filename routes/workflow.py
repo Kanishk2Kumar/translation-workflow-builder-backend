@@ -2,6 +2,8 @@ import hashlib
 import json
 import uuid
 from datetime import datetime
+import base64
+import os
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
@@ -108,10 +110,8 @@ async def run_workflow(
     pool = get_pool()
     contents = await file.read()
 
-    # 1. Compute document hash
     document_hash = compute_hash(contents, target_language)
 
-    # 2. Check cache — same document + same language + same workflow?
     cached = await get_cached_execution(pool, document_hash, workflow_id)
     if cached:
         return RunWorkflowResponse(
@@ -122,19 +122,13 @@ async def run_workflow(
             cache_hit=True,
         )
 
-    # 3. Extract text from file
     raw_text = extract_text(file.filename, contents)
 
-    # 4. Fetch workflow from DB
     row = await pool.fetchrow(
-        "SELECT id, nodes, edges FROM workflows WHERE id = $1",
-        workflow_id,
+        "SELECT id, nodes, edges FROM workflows WHERE id = $1", workflow_id,
     )
     if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Workflow '{workflow_id}' not found",
-        )
+        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
 
     nodes = json.loads(row["nodes"]) if isinstance(row["nodes"], str) else row["nodes"]
     edges = json.loads(row["edges"]) if isinstance(row["edges"], str) else row["edges"]
@@ -142,7 +136,6 @@ async def run_workflow(
     if not nodes:
         raise HTTPException(status_code=400, detail="Workflow has no nodes")
 
-    # 5. Create execution record — store hash in input for future cache lookups
     execution_id = str(uuid.uuid4())
     await pool.execute(
         """
@@ -159,17 +152,16 @@ async def run_workflow(
         datetime.utcnow(),
     )
 
-    # 6. Build initial context
     initial_context = {
         "raw_text": raw_text,
+        "file_bytes": contents,              # ← raw bytes, needed by DocumentParserNode
         "target_language": target_language,
         "execution_id": execution_id,
         "workflow_id": workflow_id,
-        "source_filename": file.filename,
+        "source_filename": file.filename,    # ← parser uses this to detect .docx/.pdf
         "document_hash": document_hash,
     }
 
-    # 7. Execute workflow
     try:
         final_context = await execute_workflow(
             nodes=nodes,
@@ -187,13 +179,15 @@ async def run_workflow(
             datetime.utcnow(),
             execution_id,
         )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Workflow execution failed: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Workflow execution failed: {str(e)}")
 
     final_output = final_context.get("final_output", {})
     logs = final_context.get("_logs", [])
+
+    # Attach b64 directly to run response (not stored in DB)
+    output_doc_bytes = final_context.get("output_document_bytes")
+    if output_doc_bytes:
+        final_output["document_b64"] = base64.b64encode(output_doc_bytes).decode("utf-8")
 
     return RunWorkflowResponse(
         execution_id=execution_id,
@@ -203,32 +197,50 @@ async def run_workflow(
         cache_hit=False,
     )
 
-
 # ─── GET /execution/{execution_id}/status ────────────────────────────────────
 
-@router.get("/execution/{execution_id}/status")
-async def get_execution_status(execution_id: str):
+@router.get("/{workflow_id}/execution/{execution_id}/download")
+async def download_translated_document(workflow_id: str, execution_id: str):
+    from fastapi.responses import Response
+
     pool = get_pool()
     row = await pool.fetchrow(
-        """
-        SELECT id, status, input, output, logs, started_at, completed_at
-        FROM executions
-        WHERE id = $1
-        """,
-        execution_id,
+        "SELECT output FROM executions WHERE id = $1 AND workflow_id = $2",
+        execution_id, workflow_id,
     )
-    if not row:
+    if not row or not row["output"]:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    output = json.loads(row["output"]) if isinstance(row["output"], str) else row["output"]
+
+    doc_path: str | None = output.get("document_path")
+    doc_format: str | None = output.get("document_format")
+
+    if not doc_path or not doc_format:
         raise HTTPException(
             status_code=404,
-            detail=f"Execution '{execution_id}' not found",
+            detail="No document output for this execution — was a DOCX or PDF uploaded?"
         )
 
-    return {
-        "execution_id": str(row["id"]),
-        "status": row["status"],
-        "input": json.loads(row["input"]) if row["input"] else None,
-        "output": json.loads(row["output"]) if row["output"] else None,
-        "logs": json.loads(row["logs"]) if row["logs"] else [],
-        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-        "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
+    if not os.path.exists(doc_path):
+        raise HTTPException(
+            status_code=410,
+            detail="Translated document has expired from temporary storage"
+        )
+
+    with open(doc_path, "rb") as f:
+        file_bytes = f.read()
+
+    content_types = {
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pdf":  "application/pdf",
     }
+
+    return Response(
+        content=file_bytes,
+        media_type=content_types.get(doc_format, "application/octet-stream"),
+        headers={
+            "Content-Disposition": f"attachment; filename=translated.{doc_format}",
+            "Content-Length": str(len(file_bytes)),
+        },
+    )
