@@ -2,7 +2,7 @@ import io
 from dataclasses import dataclass, field
 from typing import Literal
 from nodes.base import BaseNode
-
+import docx
 
 @dataclass
 class DocumentBlock:
@@ -60,15 +60,26 @@ class DocumentParserNode(BaseNode):
     # ── DOCX ─────────────────────────────────────────────────────────────────
 
     def _parse_docx(self, file_bytes: bytes) -> list[DocumentBlock]:
-        import docx
         doc = docx.Document(io.BytesIO(file_bytes))
         blocks = []
         idx = 0
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
         for para in doc.paragraphs:
             text = para.text.strip()
             if not text:
+                continue  # empty or image-only paragraph — skip, don't create a block
+
+            # Check this paragraph actually has translatable text runs
+            # (not just drawing runs which also contribute to para.text weirdly)
+            has_text_run = any(
+                r.find(f"{{{W}}}t") is not None
+                and r.find(f"{{{W}}}drawing") is None
+                for r in para._element.findall(f"{{{W}}}r")
+            )
+            if not has_text_run:
                 continue
+
             style_name = para.style.name if para.style else ""
             block_type = "heading" if style_name.startswith("Heading") else "paragraph"
             blocks.append(DocumentBlock(
@@ -91,13 +102,11 @@ class DocumentParserNode(BaseNode):
                             block_id=f"tc{idx}",
                             block_type="table_cell",
                             source_text=text,
-                            block_ref=para,          # paragraph inside cell
+                            block_ref=para,
                             metadata={"style": para.style.name if para.style else ""},
                         ))
                         idx += 1
 
-        # Store the live doc object so rebuilder can save it
-        # We attach it to the last block's metadata as a sentinel
         if blocks:
             blocks[0].metadata["_docx_doc"] = doc
 

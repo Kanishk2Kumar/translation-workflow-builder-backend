@@ -1,7 +1,7 @@
 import io
 import copy
 from nodes.base import BaseNode
-
+import docx
 
 class DocumentRebuilderNode(BaseNode):
     """
@@ -61,49 +61,53 @@ class DocumentRebuilderNode(BaseNode):
     # ── DOCX rebuild ─────────────────────────────────────────────────────────
 
     def _rebuild_docx(self, blocks: list) -> bytes:
-        import docx
-        from docx.oxml.ns import qn
         from lxml import etree
 
-        # Retrieve the live doc object stored in first block's metadata
         doc = blocks[0].metadata.get("_docx_doc")
         if not doc:
             raise ValueError("No _docx_doc reference found in blocks")
+
+        # Word XML namespace
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
         for block in blocks:
             if not block.translated_text or not block.block_ref:
                 continue
 
-            para = block.block_ref  # python-docx Paragraph object
+            para = block.block_ref  # python-docx Paragraph
 
-            # Strategy: clear all runs, write translated text into first run,
-            # preserving the formatting (bold, font size, color) of the first run.
-            if not para.runs:
-                para.text = block.translated_text
+            # Find all <w:r> run elements that contain <w:t> text nodes
+            # Runs with <w:drawing> or <w:pict> are images — never touch them
+            text_runs = [
+                r for r in para._element.findall(f"{{{W}}}r")
+                if r.find(f"{{{W}}}t") is not None
+                and r.find(f"{{{W}}}drawing") is None
+                and r.find(f"{{{W}}}pict") is None
+            ]
+
+            if not text_runs:
+                # Paragraph has no text runs (maybe it's pure image) — skip entirely
                 continue
 
-            # Snapshot formatting from first run
-            first_run = para.runs[0]
-            bold = first_run.bold
-            italic = first_run.italic
-            font_name = first_run.font.name
-            font_size = first_run.font.size
-            font_color = first_run.font.color.rgb if first_run.font.color and first_run.font.color.type else None
+            # Put the full translated text into the FIRST text run's <w:t>
+            first_text_run = text_runs[0]
+            t_elem = first_text_run.find(f"{{{W}}}t")
+            if t_elem is not None:
+                t_elem.text = block.translated_text
+                # xml:space="preserve" prevents Word from trimming leading/trailing spaces
+                t_elem.set(
+                    "{http://www.w3.org/XML/1998/namespace}space",
+                    "preserve"
+                )
 
-            # Clear paragraph XML runs entirely
-            for run in para.runs:
-                run._element.getparent().remove(run._element)
+            # Clear <w:t> content from all OTHER text runs (they're now redundant)
+            # but leave the run element itself so formatting/spacing isn't broken
+            for run in text_runs[1:]:
+                t_elem = run.find(f"{{{W}}}t")
+                if t_elem is not None:
+                    t_elem.text = ""
 
-            # Add a single new run with the translation
-            new_run = para.add_run(block.translated_text)
-            new_run.bold = bold
-            new_run.italic = italic
-            if font_name:
-                new_run.font.name = font_name
-            if font_size:
-                new_run.font.size = font_size
-            if font_color:
-                new_run.font.color.rgb = font_color
+            # Drawing/image runs are never touched — they stay exactly where they are
 
         buffer = io.BytesIO()
         doc.save(buffer)
