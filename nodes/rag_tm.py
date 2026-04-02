@@ -5,12 +5,13 @@ from db import get_pool
 # Lazy-load the embedding model so startup stays fast
 _model = None
 
+
 def get_embedding_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer("intfloat/multilingual-e5-large")
-        print("✅ Embedding model loaded")
+        print("Embedding model loaded")
     return _model
 
 
@@ -22,13 +23,92 @@ def embed(texts: list[str]) -> list[list[float]]:
     return embeddings.tolist()
 
 
+async def fetch_rag_candidates(
+    segments: list[str],
+    embeddings: list[list[float]],
+    target_language: str,
+    top_k: int,
+) -> dict[int, list[dict]]:
+    pool = get_pool()
+    embedding_texts = [str(embedding) for embedding in embeddings]
+
+    rows = await pool.fetch(
+        """
+        WITH input_segments AS (
+            SELECT segment, embedding_text, ord::int AS ord
+            FROM unnest($1::text[], $2::text[]) WITH ORDINALITY
+              AS t(segment, embedding_text, ord)
+        )
+        SELECT
+            i.ord,
+            i.segment,
+            tm.source_text,
+            tm.target_text,
+            CASE
+                WHEN tm.source_text IS NULL THEN NULL
+                ELSE 1 - (tm.embedding <=> i.embedding_text::vector)
+            END AS similarity
+        FROM input_segments i
+        LEFT JOIN LATERAL (
+            SELECT source_text, target_text, embedding
+            FROM translation_memory
+            WHERE target_language = $3
+            ORDER BY embedding <=> i.embedding_text::vector
+            LIMIT $4
+        ) tm ON TRUE
+        ORDER BY i.ord, similarity DESC NULLS LAST
+        """,
+        segments,
+        embedding_texts,
+        target_language,
+        top_k,
+    )
+
+    grouped: dict[int, list[dict]] = {idx: [] for idx in range(len(segments))}
+    for row in rows:
+        idx = int(row["ord"]) - 1
+        if row["source_text"] is None:
+            continue
+        grouped[idx].append({
+            "source": row["source_text"],
+            "translation": row["target_text"],
+            "score": round(float(row["similarity"]), 4),
+        })
+
+    return grouped
+
+
+def build_rag_match(segment: str, matches: list[dict], exact_threshold: float, fuzzy_threshold: float) -> tuple[dict, str]:
+    if not matches:
+        return {
+            "segment": segment,
+            "match_type": "new",
+            "matches": [],
+        }, "new"
+
+    best_score = float(matches[0]["score"])
+    if best_score >= exact_threshold:
+        match_type = "exact"
+    elif best_score >= fuzzy_threshold:
+        match_type = "fuzzy"
+    else:
+        match_type = "new"
+
+    return {
+        "segment": segment,
+        "match_type": match_type,
+        "best_score": round(best_score, 4),
+        "matches": matches,
+    }, match_type
+
+
 class RAGNode(BaseNode):
     """
     Queries the translation memory (pgvector) for each segment.
     Classifies matches as:
-      exact  — cosine similarity >= exact_threshold  (auto-fill)
-      fuzzy  — cosine similarity >= fuzzy_threshold  (suggestion)
-      new    — below fuzzy threshold (send to LLM)
+      exact  - cosine similarity >= exact_threshold  (auto-fill)
+      fuzzy  - cosine similarity >= fuzzy_threshold  (suggestion)
+      new    - below fuzzy threshold (send to LLM)
     """
 
     async def run(self, context: dict) -> dict:
@@ -42,63 +122,25 @@ class RAGNode(BaseNode):
         target_language: str = context.get("target_language", "hi")
 
         embeddings = embed(segments)
-        pool = get_pool()
+        candidate_map = await fetch_rag_candidates(
+            segments=segments,
+            embeddings=embeddings,
+            target_language=target_language,
+            top_k=top_k,
+        )
 
         rag_matches = []
         stats = {"exact": 0, "fuzzy": 0, "new": 0}
 
-        for segment, embedding in zip(segments, embeddings):
-            # pgvector cosine similarity query
-            # Requires a translation_memory table — see SQL below
-            rows = await pool.fetch(
-                """
-                SELECT source_text, target_text, target_language,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM translation_memory
-                WHERE target_language = $2
-                ORDER BY embedding <=> $1::vector
-                LIMIT $3
-                """,
-                str(embedding),
-                target_language,
-                top_k,
+        for idx, segment in enumerate(segments):
+            match, match_type = build_rag_match(
+                segment=segment,
+                matches=candidate_map.get(idx, []),
+                exact_threshold=exact_threshold,
+                fuzzy_threshold=fuzzy_threshold,
             )
-
-            if not rows:
-                match_type = "new"
-                stats["new"] += 1
-                rag_matches.append({
-                    "segment": segment,
-                    "match_type": "new",
-                    "matches": [],
-                })
-                continue
-
-            best_score = float(rows[0]["similarity"])
-
-            if best_score >= exact_threshold:
-                match_type = "exact"
-                stats["exact"] += 1
-            elif best_score >= fuzzy_threshold:
-                match_type = "fuzzy"
-                stats["fuzzy"] += 1
-            else:
-                match_type = "new"
-                stats["new"] += 1
-
-            rag_matches.append({
-                "segment": segment,
-                "match_type": match_type,
-                "best_score": round(best_score, 4),
-                "matches": [
-                    {
-                        "source": r["source_text"],
-                        "translation": r["target_text"],
-                        "score": round(float(r["similarity"]), 4),
-                    }
-                    for r in rows
-                ],
-            })
+            stats[match_type] += 1
+            rag_matches.append(match)
 
         return {
             **context,
@@ -107,7 +149,7 @@ class RAGNode(BaseNode):
         }
 
 
-# ─── SQL to create the translation_memory table ──────────────────────────────
+# SQL to create the translation_memory table
 #
 # Run this once in your PostgreSQL instance:
 #
