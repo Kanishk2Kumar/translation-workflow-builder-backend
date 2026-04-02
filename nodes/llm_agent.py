@@ -15,33 +15,40 @@ TONE_INSTRUCTIONS = {
 }
 
 
-def build_prompt(source_text, target_language, tone, rag_matches, system_prompt):
+def build_prompt(source_text, target_language, tone, rag_matches, system_prompt, glossary_terms=None):
     lang_name = LANGUAGE_NAMES.get(target_language, target_language)
     tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS["formal"])
 
-    examples_block = ""
-    useful_matches = [
-        m for m in rag_matches
-        if m.get("match_type") == "fuzzy" and m.get("matches")
-    ]
-    if useful_matches:
-        examples = []
-        for match in useful_matches[:3]:
-            best = match["matches"][0]
-            examples.append(
-                f"Source: {best['source']}\n"
-                f"Translation ({lang_name}): {best['translation']}"
-            )
-        examples_block = (
-            "\n\nReference translations from approved memory:\n"
-            + "\n\n".join(examples)
+    # Glossary block — injected into system prompt
+    glossary_block = ""
+    if glossary_terms:
+        term_lines = "\n".join(
+            f"  {t['source_term']} → {t['target_term']}"
+            for t in glossary_terms[:30]  # cap at 30 to stay within context
+        )
+        glossary_block = (
+            f"\n\nApproved glossary — use these translations exactly, do not alter them:\n"
+            f"{term_lines}"
+            f"\n\nAny term wrapped in {{{{GLOS_...}}}} is a locked glossary placeholder — "
+            f"keep it exactly as written, do not translate it."
         )
 
+    # RAG fuzzy match examples block
+    examples_block = ""
+    useful_matches = [m for m in rag_matches if m.get("match_type") == "fuzzy" and m.get("matches")]
+    if useful_matches:
+        examples = [
+            f"Source: {m['matches'][0]['source']}\nTranslation ({lang_name}): {m['matches'][0]['translation']}"
+            for m in useful_matches[:3]
+        ]
+        examples_block = "\n\nReference translations from approved memory:\n" + "\n\n".join(examples)
+
     system = system_prompt or (
-        f"You are an expert medical translator specialising in English to {lang_name} translation. "
+        f"You are an expert translator specialising in English to {lang_name} translation. "
         f"{tone_instruction} "
-        f"Never translate ICD codes, CPT codes, or MRN numbers — keep them exactly as-is. "
+        f"Never translate ICD codes, CPT codes, MRN numbers, or passport numbers — keep them exactly as-is. "
         f"Return only the translated text with no explanation or preamble."
+        f"{glossary_block}"
     )
 
     user = (
@@ -70,7 +77,14 @@ class LLMAgentNode(BaseNode):
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
         total_input_tokens = 0
         total_output_tokens = 0
+        glossary_terms = context.get("glossary_terms", []) 
+        glossary_map: dict = context.get("glossary_map", {})
 
+        def restore_glossary(text: str) -> str:
+            for placeholder, target_term in glossary_map.items():
+                text = text.replace(placeholder, target_term)
+            return text
+        
         # ── Fast path: ALL segments exact TM hits ─────────────────────────────
         if rag_matches and all(
             m.get("match_type") == "exact" and m.get("matches")
@@ -110,8 +124,9 @@ class LLMAgentNode(BaseNode):
                         source_text=seg,
                         target_language=target_language,
                         tone=tone,
-                        rag_matches=[match],   # pass this segment's own matches as context
+                        rag_matches=[match],
                         system_prompt=system_prompt,
+                        glossary_terms=glossary_terms,   # ← add this
                     )
                     try:
                         response = client.chat.completions.create(
@@ -122,7 +137,7 @@ class LLMAgentNode(BaseNode):
                                 {"role": "user",   "content": user},
                             ],
                         )
-                        segment_translations[seg] = response.choices[0].message.content.strip()
+                        segment_translations[seg] = restore_glossary(response.choices[0].message.content.strip())
                         total_input_tokens  += response.usage.prompt_tokens
                         total_output_tokens += response.usage.completion_tokens
                     except Exception as e:
@@ -138,11 +153,12 @@ class LLMAgentNode(BaseNode):
         else:
             # No RAG node in pipeline — translate full text as one call
             system, user = build_prompt(
-                source_text=raw_text,
+                source_text=seg,
                 target_language=target_language,
                 tone=tone,
-                rag_matches=[],
+                rag_matches=[match],
                 system_prompt=system_prompt,
+                glossary_terms=glossary_terms,   # ← add this
             )
             response = client.chat.completions.create(
                 model=model,

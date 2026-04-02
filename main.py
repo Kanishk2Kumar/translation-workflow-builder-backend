@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from db import connect_db, disconnect_db
 from routes.workflow import router as workflow_router
 from config import settings
-
+from routes.glossary import router as glossary_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,7 +29,7 @@ app.add_middleware(
 )
 
 app.include_router(workflow_router)
-
+app.include_router(glossary_router)
 
 @app.get("/")
 async def health():

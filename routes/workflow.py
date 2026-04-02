@@ -154,12 +154,13 @@ async def run_workflow(
 
     initial_context = {
         "raw_text": raw_text,
-        "file_bytes": contents,              # ← raw bytes, needed by DocumentParserNode
+        "file_bytes": contents,
         "target_language": target_language,
         "execution_id": execution_id,
         "workflow_id": workflow_id,
-        "source_filename": file.filename,    # ← parser uses this to detect .docx/.pdf
+        "source_filename": file.filename,
         "document_hash": document_hash,
+        "user_id": '37720c15-ff75-49eb-a538-b25fd2273d30',           # ← add this (from auth header once JWT is wired)
     }
 
     try:
@@ -201,6 +202,7 @@ async def run_workflow(
 
 @router.get("/{workflow_id}/execution/{execution_id}/download")
 async def download_translated_document(workflow_id: str, execution_id: str):
+    import re
     from fastapi.responses import Response
 
     pool = get_pool()
@@ -215,6 +217,7 @@ async def download_translated_document(workflow_id: str, execution_id: str):
 
     doc_path: str | None = output.get("document_path")
     doc_format: str | None = output.get("document_format")
+    phi_map: dict = output.get("phi_map", {})
 
     if not doc_path or not doc_format:
         raise HTTPException(
@@ -231,6 +234,12 @@ async def download_translated_document(workflow_id: str, execution_id: str):
     with open(doc_path, "rb") as f:
         file_bytes = f.read()
 
+    # ── Safety net: re-apply PHI restore directly to document bytes ──────────
+    if phi_map:
+        if doc_format == "docx":
+            file_bytes = _restore_phi_in_docx(file_bytes, phi_map)
+        # PDF restore can be added later
+
     content_types = {
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "pdf":  "application/pdf",
@@ -244,3 +253,41 @@ async def download_translated_document(workflow_id: str, execution_id: str):
             "Content-Length": str(len(file_bytes)),
         },
     )
+
+
+def _restore_phi_in_docx(file_bytes: bytes, phi_map: dict) -> bytes:
+    import io
+    import docx
+
+    if not phi_map:
+        return file_bytes
+
+    doc = docx.Document(io.BytesIO(file_bytes))
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    def restore_text(text: str) -> str:
+        for placeholder, original in phi_map.items():
+            text = text.replace(placeholder, original)
+        return text
+
+    for para in doc.paragraphs:
+        for run in para.runs:
+            if run.text and "PHIMASK" in run.text:
+                run.text = restore_text(run.text)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        if run.text and "PHIMASK" in run.text:
+                            run.text = restore_text(run.text)
+
+    # Direct XML walk catches placeholders split across <w:t> elements
+    for elem in doc.element.iter(f"{{{W}}}t"):
+        if elem.text and "PHIMASK" in elem.text:
+            elem.text = restore_text(elem.text)
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
