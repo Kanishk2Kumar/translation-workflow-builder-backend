@@ -1,14 +1,70 @@
-import base64
+import asyncio
 import json
 import os
-import tempfile
 from datetime import datetime, timezone
+
 from nodes.base import BaseNode
 from db import get_pool
 
 # Persistent temp dir for translated documents
 TRANSLATED_DOCS_DIR = "/tmp/translatio_outputs"
 os.makedirs(TRANSLATED_DOCS_DIR, exist_ok=True)
+
+
+async def seed_translation_memory(seed_payload: dict) -> None:
+    segment_translations: dict = seed_payload.get("segment_translations", {})
+    target_language: str = seed_payload.get("target_language", "hi")
+
+    if not segment_translations:
+        return
+
+    try:
+        pool = get_pool()
+        segments = list(segment_translations.keys())
+        existing_rows = await pool.fetch(
+            """
+            SELECT source_text
+            FROM translation_memory
+            WHERE target_language = $1
+              AND source_text = ANY($2::text[])
+            """,
+            target_language,
+            segments,
+        )
+        existing_segments = {row["source_text"] for row in existing_rows}
+        missing_segments = [
+            segment for segment in segments
+            if segment not in existing_segments
+        ]
+
+        if not missing_segments:
+            print("TM seeding skipped: all segments already exist")
+            return
+
+        from nodes.rag_tm import embed
+
+        embeddings = await asyncio.to_thread(embed, missing_segments)
+        rows = [
+            (
+                segment,
+                segment_translations[segment],
+                target_language,
+                str(embedding),
+            )
+            for segment, embedding in zip(missing_segments, embeddings)
+        ]
+
+        await pool.executemany(
+            """
+            INSERT INTO translation_memory
+              (source_text, target_text, source_language, target_language, embedding)
+            VALUES ($1, $2, 'en', $3, $4::vector)
+            """,
+            rows,
+        )
+        print(f"TM seeding complete: inserted {len(rows)} segments")
+    except Exception as e:
+        print(f"TM seeding failed: {e}")
 
 
 class OutputNode(BaseNode):
@@ -21,12 +77,10 @@ class OutputNode(BaseNode):
         logs: list = context.get("_logs", [])
         execution_id: str = context.get("execution_id", "")
         workflow_id: str = context.get("workflow_id", "")
-        raw_text: str = context.get("raw_text", "")
 
         output_doc_bytes: bytes | None = context.get("output_document_bytes")
         output_doc_format: str = context.get("output_document_format", "text")
 
-        # ── Save document to disk, store path in DB ───────────────────────────
         doc_file_path: str | None = None
         if output_doc_bytes and execution_id:
             ext = output_doc_format if output_doc_format in ("docx", "pdf") else "bin"
@@ -46,7 +100,6 @@ class OutputNode(BaseNode):
                 "input": context.get("input_tokens", 0),
                 "output": context.get("output_tokens", 0),
             },
-            # Store path + format in DB — not the bytes themselves
             "document_path": doc_file_path,
             "document_format": output_doc_format if output_doc_bytes else None,
         }
@@ -76,47 +129,18 @@ class OutputNode(BaseNode):
                 execution_id,
             )
 
-        # ── Seed TM ───────────────────────────────────────────────────────────
+        tm_seed_payload = None
         if translated_text and not context.get("tm_hit"):
             segment_translations: dict = context.get("segment_translations", {})
-
             if segment_translations:
-                try:
-                    from nodes.rag_tm import embed
-                    segs = list(segment_translations.keys())
-                    embeddings = embed(segs)
+                tm_seed_payload = {
+                    "target_language": context.get("target_language", "hi"),
+                    "segment_translations": segment_translations,
+                }
 
-                    for segment, embedding in zip(segs, embeddings):
-                        target_text = segment_translations[segment]
-
-                        existing = await pool.fetchval(
-                            """
-                            SELECT id FROM translation_memory
-                            WHERE source_text = $1 AND target_language = $2
-                            LIMIT 1
-                            """,
-                            segment,
-                            context.get("target_language", "hi"),
-                        )
-                        if not existing:
-                            await pool.execute(
-                                """
-                                INSERT INTO translation_memory
-                                  (source_text, target_text, source_language, target_language, embedding)
-                                VALUES ($1, $2, 'en', $3, $4::vector)
-                                """,
-                                segment,
-                                target_text,
-                                context.get("target_language", "hi"),
-                                str(embedding),
-                            )
-                except Exception as e:
-                    print(f"⚠️  TM seeding failed: {e}")
-
-        # Return bytes in context so the route handler can stream them directly
-        # without a second DB/disk read if it wants to
         return {
             **context,
             "final_output": output_payload,
-            "output_document_bytes": output_doc_bytes,  # keep in context for route
+            "output_document_bytes": output_doc_bytes,
+            "tm_seed_payload": tm_seed_payload,
         }
