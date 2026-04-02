@@ -1,3 +1,5 @@
+import re
+
 from openai import OpenAI
 from nodes.base import BaseNode
 from config import settings
@@ -8,10 +10,10 @@ LANGUAGE_NAMES = {
 }
 
 TONE_INSTRUCTIONS = {
-    "clinical":         "Use formal clinical terminology. This text is for healthcare professionals.",
+    "clinical": "Use formal clinical terminology. This text is for healthcare professionals.",
     "patient_friendly": "Use simple, clear language. This text is for patients with no medical background.",
-    "formal":           "Use formal language appropriate for official documents.",
-    "technical":        "Use precise technical language. Preserve all technical terms.",
+    "formal": "Use formal language appropriate for official documents.",
+    "technical": "Use precise technical language. Preserve all technical terms.",
 }
 
 
@@ -19,18 +21,17 @@ def build_prompt(source_text, target_language, tone, rag_matches, system_prompt,
     lang_name = LANGUAGE_NAMES.get(target_language, target_language)
     tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS["formal"])
 
-    # Glossary block — injected into system prompt
+    # Build glossary instruction block
     glossary_block = ""
     if glossary_terms:
         term_lines = "\n".join(
-            f"  {t['source_term']} → {t['target_term']}"
-            for t in glossary_terms[:30]  # cap at 30 to stay within context
+            f'  - "{t["source_term"]}" must always be translated as "{t["target_term"]}"'
+            for t in glossary_terms[:30]
         )
         glossary_block = (
-            f"\n\nApproved glossary — use these translations exactly, do not alter them:\n"
-            f"{term_lines}"
-            f"\n\nAny term wrapped in {{{{GLOS_...}}}} is a locked glossary placeholder — "
-            f"keep it exactly as written, do not translate it."
+            "\n\nMANDATORY GLOSSARY - these translations are fixed and must not be altered:\n"
+            f"{term_lines}\n"
+            "Do not paraphrase, synonymize, or skip any of the above terms."
         )
 
     # RAG fuzzy match examples block
@@ -46,8 +47,8 @@ def build_prompt(source_text, target_language, tone, rag_matches, system_prompt,
     system = system_prompt or (
         f"You are an expert translator specialising in English to {lang_name} translation. "
         f"{tone_instruction} "
-        f"Never translate ICD codes, CPT codes, MRN numbers, or passport numbers — keep them exactly as-is. "
-        f"Return only the translated text with no explanation or preamble."
+        "Never translate ICD codes, CPT codes, MRN numbers, or passport numbers - keep them exactly as-is. "
+        "Return only the translated text with no explanation or preamble."
         f"{glossary_block}"
     )
 
@@ -58,6 +59,24 @@ def build_prompt(source_text, target_language, tone, rag_matches, system_prompt,
     )
 
     return system, user
+
+
+def restore_glossary(text: str, glossary_map: dict[str, str]) -> str:
+    """
+    Post-translation correction pass.
+    1. If the source term still appears in translated text -> replace with target term
+    2. No placeholder logic needed - terms go via prompt instructions
+    """
+    if not glossary_map:
+        return text
+
+    for source_term, target_term in glossary_map.items():
+        pattern = r"(?<!\w)" + re.escape(source_term) + r"(?!\w)"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            text = re.sub(pattern, target_term, text, flags=re.IGNORECASE)
+            print(f"glossary correction: '{source_term}' -> '{target_term}'")
+
+    return text
 
 
 class LLMAgentNode(BaseNode):
@@ -77,23 +96,21 @@ class LLMAgentNode(BaseNode):
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
         total_input_tokens = 0
         total_output_tokens = 0
-        glossary_terms = context.get("glossary_terms", []) 
-        glossary_map: dict = context.get("glossary_map", {})
+        glossary_terms = context.get("glossary_terms", [])
+        glossary_map: dict[str, str] = context.get("glossary_map", {})
 
-        def restore_glossary(text: str) -> str:
-            for placeholder, target_term in glossary_map.items():
-                text = text.replace(placeholder, target_term)
-            return text
-        
-        # ── Fast path: ALL segments exact TM hits ─────────────────────────────
+        print(f"DEBUG llm_agent: glossary_map has {len(glossary_map)} entries: {glossary_map}")
+
+        # Fast path: ALL segments exact TM hits
         if rag_matches and all(
             m.get("match_type") == "exact" and m.get("matches")
             for m in rag_matches
         ):
             segment_translations = {
-                m["segment"]: m["matches"][0]["translation"] for m in rag_matches
+                m["segment"]: restore_glossary(m["matches"][0]["translation"], glossary_map)
+                for m in rag_matches
             }
-            translated_text = " ".join(
+            translated_text = "\n".join(
                 segment_translations[m["segment"]] for m in rag_matches
             )
             return {
@@ -106,27 +123,26 @@ class LLMAgentNode(BaseNode):
                 "tm_hit": True,
             }
 
-        # ── Build per-segment translation map ────────────────────────────────
-        # For every segment: exact → use cache, anything else → call OpenAI
+        # Build per-segment translation map
+        # For every segment: exact -> use cache, anything else -> call OpenAI
         segment_translations: dict[str, str] = {}
 
         if rag_matches:
             for match in rag_matches:
                 seg = match["segment"]
-
                 if match.get("match_type") == "exact" and match.get("matches"):
-                    # Reuse cached translation directly
-                    segment_translations[seg] = match["matches"][0]["translation"]
-
+                    segment_translations[seg] = restore_glossary(
+                        match["matches"][0]["translation"],
+                        glossary_map,
+                    )
                 else:
-                    # fuzzy or new → call OpenAI for this segment
                     system, user = build_prompt(
                         source_text=seg,
                         target_language=target_language,
                         tone=tone,
                         rag_matches=[match],
                         system_prompt=system_prompt,
-                        glossary_terms=glossary_terms,   # ← add this
+                        glossary_terms=glossary_terms,
                     )
                     try:
                         response = client.chat.completions.create(
@@ -134,52 +150,60 @@ class LLMAgentNode(BaseNode):
                             max_tokens=max_tokens,
                             messages=[
                                 {"role": "system", "content": system},
-                                {"role": "user",   "content": user},
+                                {"role": "user", "content": user},
                             ],
                         )
-                        segment_translations[seg] = restore_glossary(response.choices[0].message.content.strip())
-                        total_input_tokens  += response.usage.prompt_tokens
+                        raw_translation = response.choices[0].message.content.strip()
+                        print(f"DEBUG raw_translation: '{raw_translation[:100]}'")
+                        segment_translations[seg] = restore_glossary(raw_translation, glossary_map)
+                        total_input_tokens += response.usage.prompt_tokens
                         total_output_tokens += response.usage.completion_tokens
                     except Exception as e:
-                        print(f"⚠️  LLM failed for segment '{seg[:40]}...': {e}")
-                        segment_translations[seg] = seg  # fallback: keep original
+                        print(f"LLM failed for segment: {e}")
+                        segment_translations[seg] = restore_glossary(seg, glossary_map)
 
-            # Assemble final text preserving original segment order
             translated_text = "\n".join(
                 segment_translations.get(m["segment"], m["segment"])
                 for m in rag_matches
             )
 
         else:
-            # No RAG node in pipeline — translate full text as one call
+            # No RAG - full text single call
             system, user = build_prompt(
-                source_text=seg,
+                source_text=raw_text,
                 target_language=target_language,
                 tone=tone,
-                rag_matches=[match],
+                rag_matches=[],
                 system_prompt=system_prompt,
-                glossary_terms=glossary_terms,   # ← add this
+                glossary_terms=glossary_terms,
             )
             response = client.chat.completions.create(
                 model=model,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
+                    {"role": "user", "content": user},
                 ],
             )
-            translated_text = response.choices[0].message.content.strip()
-            segment_translations = {}  # no per-segment map without RAG
-            total_input_tokens  = response.usage.prompt_tokens
+            raw_translation = response.choices[0].message.content.strip()
+            print(f"DEBUG raw_translation: '{raw_translation[:100]}'")
+            translated_text = restore_glossary(raw_translation, glossary_map)
+            segment_translations = {}
+            total_input_tokens = response.usage.prompt_tokens
             total_output_tokens = response.usage.completion_tokens
 
-        print(f"DEBUG llm: {len(segment_translations)} segments translated, "
-              f"tokens in={total_input_tokens} out={total_output_tokens}")
-        print(f"DEBUG llm: rag_matches={len(rag_matches)}, " f"segment_translations={len(segment_translations)}, "f"tm_hit={False}")
+        print(
+            f"DEBUG llm: {len(segment_translations)} segments translated, "
+            f"tokens in={total_input_tokens} out={total_output_tokens}"
+        )
+        print(
+            f"DEBUG llm: rag_matches={len(rag_matches)}, "
+            f"segment_translations={len(segment_translations)}, tm_hit={False}"
+        )
         return {
             **context,
             "translated_text": translated_text,
-            "segment_translations": segment_translations,  # ← THIS is what rebuilder needs
+            "segment_translations": segment_translations,
             "llm_model": model,
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens,
