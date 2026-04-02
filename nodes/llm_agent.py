@@ -4,6 +4,8 @@ from openai import OpenAI
 from nodes.base import BaseNode
 from config import settings
 
+_client: OpenAI | None = None
+
 LANGUAGE_NAMES = {
     "hi": "Hindi", "es": "Spanish", "fr": "French", "de": "German",
     "ja": "Japanese", "mr": "Marathi", "ta": "Tamil", "te": "Telugu",
@@ -15,6 +17,13 @@ TONE_INSTRUCTIONS = {
     "formal": "Use formal language appropriate for official documents.",
     "technical": "Use precise technical language. Preserve all technical terms.",
 }
+
+
+def get_openai_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    return _client
 
 
 def build_prompt(source_text, target_language, tone, rag_matches, system_prompt, glossary_terms=None):
@@ -93,7 +102,7 @@ class LLMAgentNode(BaseNode):
         system_prompt: str | None = self.config.get("system_prompt")
         rag_matches: list = context.get("rag_matches", [])
 
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        client = get_openai_client()
         total_input_tokens = 0
         total_output_tokens = 0
         glossary_terms = context.get("glossary_terms", [])
