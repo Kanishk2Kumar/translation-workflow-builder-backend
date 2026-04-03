@@ -5,11 +5,12 @@ from datetime import datetime
 import base64
 import os
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
 from db import get_pool
 from executor import execute_workflow
+from nodes.output import seed_translation_memory
 
 router = APIRouter(prefix="/workflow", tags=["workflow"])
 
@@ -104,6 +105,7 @@ async def get_cached_execution(
 @router.post("/{workflow_id}/run", response_model=RunWorkflowResponse)
 async def run_workflow(
     workflow_id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     target_language: str = Form(default="hi"),
 ):
@@ -184,6 +186,10 @@ async def run_workflow(
 
     final_output = final_context.get("final_output", {})
     logs = final_context.get("_logs", [])
+    tm_seed_payload = final_context.get("tm_seed_payload")
+
+    if tm_seed_payload:
+        background_tasks.add_task(seed_translation_memory, tm_seed_payload)
 
     # Attach b64 directly to run response (not stored in DB)
     output_doc_bytes = final_context.get("output_document_bytes")

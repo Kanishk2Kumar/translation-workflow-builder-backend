@@ -86,13 +86,8 @@ class PHIDetectorNode(BaseNode):
         if all_detections and execution_id:
             try:
                 pool = get_pool()
-                for det in all_detections:
-                    await pool.execute(
-                        """
-                        INSERT INTO pii_audit
-                          (execution_id, user_id, phi_type, placeholder, original_value, segment_idx)
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                        """,
+                rows = [
+                    (
                         execution_id,
                         user_id or None,
                         det["phi_type"],
@@ -100,6 +95,16 @@ class PHIDetectorNode(BaseNode):
                         det["original_value"],
                         det["segment_idx"],
                     )
+                    for det in all_detections
+                ]
+                await pool.executemany(
+                    """
+                    INSERT INTO pii_audit
+                      (execution_id, user_id, phi_type, placeholder, original_value, segment_idx)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    rows,
+                )
             except Exception as e:
                 print(f"⚠️  PII audit write failed: {e}")
 
