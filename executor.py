@@ -10,6 +10,7 @@ NODE_PRIORITY = {
     "vector_db":          2,
     "glossary":           3,
     "llm_agent":          4,
+    "azure_translate":    4,
     "translation":        4,
     "phi_restore":        5,
     "compliance":         5,
