@@ -106,6 +106,12 @@ class OutputNode(BaseNode):
             "compliance_errors": context.get("compliance_errors", []),
             "compliance_suggestions": context.get("compliance_suggestions", []),
             "compliance_report": context.get("compliance_report"),
+            "ocr_provider": context.get("ocr_provider"),
+            "ocr_confidence": context.get("ocr_confidence"),
+            "ocr_status": context.get("ocr_status"),
+            "ocr_warnings": context.get("ocr_warnings", []),
+            "review_required": context.get("review_required", False),
+            "review_reason": context.get("review_reason"),
         }
 
         if include_audit:
