@@ -1,5 +1,6 @@
 import asyncpg
-from config import settings
+
+HARDCODED_DB_URL = "HARDCODED_DB_URL"
 
 _pool: asyncpg.Pool | None = None
 
@@ -7,9 +8,11 @@ _pool: asyncpg.Pool | None = None
 async def connect_db():
     global _pool
     _pool = await asyncpg.create_pool(
-        dsn=settings.DB_URL,
+        dsn=HARDCODED_DB_URL,
         min_size=2,
         max_size=10,
+        ssl="require",
+        statement_cache_size=0,
     )
     print("✅ Database pool created")
 
