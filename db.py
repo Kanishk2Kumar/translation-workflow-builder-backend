@@ -1,6 +1,6 @@
 import asyncpg
 
-HARDCODED_DB_URL = "postgresql://postgres.ptscvzaofehydyayeetx:kanishk_1604@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
+HARDCODED_DB_URL = "HARDCODED_DB_URL"
 
 _pool: asyncpg.Pool | None = None
 
