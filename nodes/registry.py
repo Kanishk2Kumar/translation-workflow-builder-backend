@@ -7,6 +7,8 @@ from nodes.glossary import GlossaryNode
 from nodes.google_translate import AzureTranslateNode, GoogleTranslateNode
 from nodes.rag_tm import RAGNode
 from nodes.llm_agent import LLMAgentNode
+from nodes.compliance_enforcer import ComplianceEnforcerNode
+from nodes.compliance import ComplianceNode
 from nodes.output import OutputNode
 
 NODE_REGISTRY: dict[str, type] = {
@@ -17,11 +19,13 @@ NODE_REGISTRY: dict[str, type] = {
     "document_rebuilder": DocumentRebuilderNode, # new
     "rag_tm":             RAGNode,
     "vector_db":          RAGNode,
+    "compliance_enforcer": ComplianceEnforcerNode,
     "llm_agent":          LLMAgentNode,
     "translation":        LLMAgentNode,
     "google_translate":   GoogleTranslateNode,
     "azure_translate":    AzureTranslateNode,
     "phi_restore":        PHIRestoreNode, 
+    "compliance":         ComplianceNode,
     "output":             OutputNode,
     "document_output":    OutputNode,
 }
