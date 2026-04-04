@@ -6,6 +6,7 @@ NODE_PRIORITY = {
     "document_parser":    0,
     "text_input":         0,
     "phi_detector":       1,
+    "compliance_enforcer": 1,
     "rag_tm":             2,
     "vector_db":          2,
     "glossary":           3,

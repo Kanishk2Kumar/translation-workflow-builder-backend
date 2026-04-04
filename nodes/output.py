@@ -102,6 +102,10 @@ class OutputNode(BaseNode):
             },
             "document_path": doc_file_path,
             "document_format": output_doc_format if output_doc_bytes else None,
+            "compliance_status": context.get("compliance_status"),
+            "compliance_errors": context.get("compliance_errors", []),
+            "compliance_suggestions": context.get("compliance_suggestions", []),
+            "compliance_report": context.get("compliance_report"),
         }
 
         if include_audit:

@@ -156,6 +156,8 @@ async def run_workflow(
 
     initial_context = {
         "raw_text": raw_text,
+        "original_raw_text": raw_text,
+        "original_segments": [raw_text] if raw_text else [],
         "file_bytes": contents,
         "target_language": target_language,
         "execution_id": execution_id,
